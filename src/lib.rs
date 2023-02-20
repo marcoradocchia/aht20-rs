@@ -51,15 +51,23 @@ struct Status {
     status_word: [u8; 1],
 }
 
+#[cfg(feature = "defmt")]
+impl defmt::Format for Status {
+    fn format(&self, fmt: defmt::Formatter) {
+        // Format as hexadecimal.
+        defmt::write!(fmt, "{=u8:#010b}", self.status_word[0]);
+    }
+}
+
 impl Status {
     /// Checks if sensor's [`Status`] is **busy**.
     fn is_busy(&self) -> bool {
-        (self.status_word[0] & 0b1000_0000) == 0
+        (self.status_word[0] & 0b1000_0000) != 0
     }
 
     /// Checks if sensor's [`Status`] is **calibrated**.
     fn is_calibrated(&self) -> bool {
-        (self.status_word[0] & 0b0000_1000) == 0
+        (self.status_word[0] & 0b0000_1000) != 0
     }
 }
 
@@ -105,55 +113,59 @@ impl From<[u8; 7]> for Aht20Data {
 
 /// **AHT20** temperature and humidity sensor.
 #[derive(Debug)]
-pub struct Aht20<I2C, D>
-where
-    D: delay::DelayMs<u16> + delay::DelayUs<u16>,
-{
+pub struct Aht20<'i2c, I2C> {
     /// I2C address of the sensor.
     address: i2c::SevenBitAddress,
     /// I2C interface.
-    i2c: I2C,
-    /// Delay implementor.
-    delay: D,
+    i2c: &'i2c mut I2C,
 }
 
-impl<I2C, E, D> Aht20<I2C, D>
+impl<'i2c, I2C, E> Aht20<'i2c, I2C>
 where
     I2C: i2c::Read<Error = E> + i2c::Write<Error = E> + i2c::WriteRead<Error = E>,
-    D: delay::DelayMs<u16> + delay::DelayUs<u16>,
 {
     /// Construct and initialize a new [`Aht20`] with the sensor's standard I2C *7-bit address*.
-    pub fn new(i2c: I2C, delay: D) -> Result<Self, Aht20Error<E>> {
+    pub fn new<D>(i2c: &'i2c mut I2C, delay: &mut D) -> Result<Self, Aht20Error<E>>
+    where
+        D: delay::DelayMs<u16> + delay::DelayUs<u16>,
+    {
         Self::with_address(STANDARD_I2C_ADDRESS, i2c, delay)
     }
 
     /// Construct and initialize a new [`Aht20`] with given I2C *7-bit address*.
-    pub fn with_address(
+    pub fn with_address<D>(
         address: i2c::SevenBitAddress,
-        i2c: I2C,
-        delay: D,
-    ) -> Result<Self, Aht20Error<E>> {
-        Self {
-            address,
-            i2c,
-            delay,
-        }
-        .init()
+        i2c: &'i2c mut I2C,
+        delay: &mut D,
+    ) -> Result<Self, Aht20Error<E>>
+    where
+        D: delay::DelayMs<u16> + delay::DelayUs<u16>,
+    {
+        Self { address, i2c }.init(delay)
     }
 
     /// Initializes a new [`Aht20`], consuming the [`Aht20Initializer`] (sensor initializer).
-    fn init(mut self) -> Result<Self, Aht20Error<E>> {
+    fn init<D>(mut self, delay: &mut D) -> Result<Self, Aht20Error<E>>
+    where
+        D: delay::DelayMs<u16> + delay::DelayUs<u16>,
+    {
+        #[cfg(feature = "defmt")]
+        defmt::info!("Initializing AHT20 sensor");
+
         // Wait 40ms after power-on.
-        self.delay.delay_ms(40);
+        delay.delay_ms(40);
 
         // Before reading temperature and humidity values, first check wheter the sensor is
         // Calibrated. If not, send `Initialization` command, then wait for 10 ms before
         // retrying.
         while !self.get_status()?.is_calibrated() {
+            #[cfg(feature = "defmt")]
+            defmt::warn!("AHT20 sensor uncalibrated: sending initialization command");
+
             // Issue initialization command.
             self.i2c.write(self.address, &[0xBE, 0x08, 0x00])?;
             // Wait 10 ms.
-            self.delay.delay_ms(10);
+            delay.delay_ms(10);
         }
 
         Ok(self)
@@ -165,6 +177,9 @@ where
         self.i2c
             .write_read(self.address, &[0x71], &mut status.status_word)?;
 
+        #[cfg(feature = "defmt")]
+        defmt::trace!("AHT20 sensor status word byte: {}", status);
+
         Ok(status)
     }
 
@@ -172,16 +187,24 @@ where
     ///
     /// # Note
     /// Calling this method takes at least 80ms.
-    pub fn measure(&mut self) -> Result<Aht20Data, Aht20Error<E>> {
+    pub fn measure<D>(&mut self, delay: &mut D) -> Result<Aht20Data, Aht20Error<E>>
+    where
+        D: delay::DelayMs<u16> + delay::DelayUs<u16>,
+    {
+        #[cfg(feature = "defmt")]
+        defmt::info!("Performing AHT20 Humidity and Temperature measurement");
+
         // Issue `TriggerMeasurement` command to the sensor.
         self.i2c.write(self.address, &[0xAC, 0x33, 0x00])?;
 
         // Wait 80ms for the measurement to be completed.
-        self.delay.delay_ms(80);
+        delay.delay_ms(80);
 
         // Sensor is busy, so keep waiting for intervals of 10 milliseconds.
         while self.get_status()?.is_busy() {
-            self.delay.delay_ms(10);
+            #[cfg(feature = "defmt")]
+            defmt::warn!("AHT20 sensor busy: keep waiting for the sensor to respond");
+            delay.delay_ms(10);
         }
 
         // Collect response buffer: 1 status byte + 5 humidity & temperature bytes + 1 CRC byte
@@ -199,12 +222,18 @@ where
     }
 
     /// Perform a **soft reset** of the sensor, without turning the power off and on again.
-    pub fn reset(&mut self) -> Result<(), Aht20Error<E>> {
+    pub fn reset<D>(&mut self, delay: &mut D) -> Result<(), Aht20Error<E>>
+    where
+        D: delay::DelayMs<u16> + delay::DelayUs<u16>,
+    {
+        #[cfg(feature = "defmt")]
+        defmt::info!("Performing AHT20 sensor soft reset");
+
         self.i2c.write(self.address, &[0xBA])?;
 
         // Wait 20ms for the reset to complete:
         // "the time required for soft reset does not exceed 20ms".
-        self.delay.delay_ms(20);
+        delay.delay_ms(20);
 
         Ok(())
     }
